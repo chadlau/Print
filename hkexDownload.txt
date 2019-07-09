@@ -1,0 +1,298 @@
+"use strict";
+const readline = require('readline');
+const chromeLauncher = require('chrome-launcher');
+const CDP = require('chrome-remote-interface');
+const fs = require('fs');
+const moment = require('moment');
+
+// const instream = fs.createReadStream('testStockNumbers.txt');
+const instream = fs.createReadStream('stockNumbers.txt');
+
+let stockNumbers = [];
+const rawData = {};
+
+let timeFormatForLog = 'DD/MM/YYYY HH:mm';
+
+let rl = readline.createInterface({
+  input: instream,
+  output: process.stdout,
+  terminal: false
+});
+
+let expectedOutputFileName = '';
+
+const URLFromStockNumber = (number) => {
+  if (parseInt(number, 10) != number) {
+    console.log(`[ERROR] invalid number value: "${number}"`);
+    return;
+  }
+
+  return `http://www.hkex.com.hk/Market-Data/Securities-Prices/Equities/Equities-Quote?sym=${number}&sc_lang=en`;
+};
+
+// start_h, start_m, end_h, end_m, is utc+0
+const dataTimeRangeFrom = (unixTime, start_h, start_m, end_h, end_m, utc_h, utc_m) => {
+  // console.log('[INFO] [GET TIME RANGE]', unixTime, start_h, start_m, end_h, end_m, utc_h, utc_m);
+  const dataTimeRange = {};
+
+  dataTimeRange.start = moment(unixTime);
+  dataTimeRange.start.hour(start_h);
+  dataTimeRange.start.minute(start_m);  
+  dataTimeRange.start.add(utc_h, 'hours').add(utc_m, 'minutes');
+
+  dataTimeRange.end = moment(unixTime);
+  dataTimeRange.end.hour(end_h);
+  dataTimeRange.end.minute(end_m);
+  dataTimeRange.end.add(utc_h, 'hours').add(utc_m, 'minutes');
+
+  return dataTimeRange;
+}
+
+const processRawData = (rawData) => {
+  console.log('[INFO] [PROCESS] [START]');
+
+  let obj = {};
+
+  Object.keys(rawData).forEach((key) => {
+    let newDataList = [];
+
+    let dataTimeRange = {
+      start: undefined,
+      end: undefined,
+    };
+
+    rawData[key].datalist.forEach((data) => {
+      if (newDataList.length === 0) {
+        newDataList.push(data);
+        
+        const { start_h, start_m, end_h, end_m } = rawData[key];
+        dataTimeRange = dataTimeRangeFrom(data[0], start_h, start_m, end_h, end_m, 8, 0);
+
+        expectedOutputFileName = expectedOutputFileName || moment(data[0]).format('YYYYMMDD');
+        return;
+      }
+
+      if (!data[1]) {
+        newDataList.push(data);
+        return;
+      }
+
+      const timeInMoment = moment(data[0]);
+      if (
+        !!dataTimeRange.start &&
+        !!dataTimeRange.end &&
+        timeInMoment.isSameOrAfter(dataTimeRange.start) &&
+        timeInMoment.isSameOrBefore(dataTimeRange.end)
+      ) {
+        newDataList.push(data);
+      }
+    });
+
+    obj[key] = newDataList;
+  });
+
+  console.log('[INFO] [PROCESS] [END]');
+
+  return obj;
+};
+const exportData = (data) => {
+  fs.writeFile((expectedOutputFileName || moment().format('YYYYMMDD')) + '.json', JSON.stringify(data), function (err) {
+    if (err) {
+      console.log('[ERROR] [EXPORT RAW DATA] error in write file');
+      return;
+    }
+    console.log('[INFO] [EXPORT RAW DATA] finished output.');
+  });
+};
+
+const processData = (data) => {
+  const obj = [];
+
+  console.log('[INFO] [PROCESS DATA] [START]');
+
+  Object.keys(data).forEach((key) => {
+    // console.log(`[INFO] [PROCESS] [${key}]`);
+
+    let sum = 0;
+    let referencePriceTimesVolume = -1;
+
+    let dataList = data[key];
+    dataList.forEach((data, index) => {
+      const [unixTime, open, high, low, close, volume, volume2] = data;
+
+      sum = sum + volume * close;
+
+      // 16:08
+      if (index >= dataList.length - 8) {
+        referencePriceTimesVolume = Math.max(referencePriceTimesVolume, volume * close);
+      }
+    });
+
+    let newObj = {
+      stockNumber: key,
+      total: sum,
+      reference: referencePriceTimesVolume,
+      percentage: referencePriceTimesVolume <= 0 ? 0 : (referencePriceTimesVolume / sum * 100),
+    };
+    const { stockNumber, percentage, total, reference } = newObj;
+    // console.log(`[INFO] [PROCESSED] ${stockNumber},${reference},${total},${percentage.toFixed(2)}%`);
+
+    obj.push(newObj);
+  });
+
+  obj.sort((lhs, rhs) => {
+    if (lhs.percentage > rhs.percentage) {//a is less than b by some ordering criterion) {
+      return -1;
+    }
+    if (lhs.percentage < rhs.percentage) {
+      return 1;
+    }
+    return lhs.stockNumber - rhs.stockNumber;
+  });
+
+  const output = obj.map((data) => {
+    const { stockNumber, percentage, total, reference } = data;
+    return `${stockNumber},${reference},${total},${percentage.toFixed(2)}%`;
+  }).join('\r\n');
+
+  console.log('[INFO] [PROCESS DATA] [FINISH]');
+
+  return output;
+};
+const exportData2 = (data) => {
+  fs.writeFile((expectedOutputFileName || moment().format('YYYYMMDD')) + '.csv', data, function (err) {
+    if (err) {
+      console.log('[ERROR] [EXPORT DATA] error in write file');
+      return;
+    }
+    console.log('[INFO] [EXPORT DATA] finished output.');
+  });
+}
+
+const finishCrawlRawData = () => {
+  const dataToExport = processRawData(rawData);
+  exportData(dataToExport);
+
+  const dataToExport2 = processData(dataToExport);
+  exportData2(dataToExport2);
+};
+  
+const startWholeProcess = async () => {
+  let currentCallback = () => {};
+  let currentStockNumber = -1;
+  let currentIndex = -1;
+  let currentTimeout;
+
+  const launchChrome = async () => {
+    return await chromeLauncher.launch({
+      chromeFlags: [
+        '--disable-gpu',
+        '--headless',
+        '--window-size=1440,900',
+      ],
+    });
+  }
+  const chrome = await launchChrome();
+  const protocol = await CDP({
+    port: chrome.port
+  });
+  const {
+    DOM,
+    Page,
+    Emulation,
+    Runtime,
+    Network,
+  } = protocol;
+  await Promise.all([Page.enable(), Runtime.enable(), DOM.enable(), Network.enable()]);
+
+  Network.responseReceived(({ requestId }) => {
+    Network.getResponseBody({ requestId }, (...args) => {
+      if (args.length < 2) {
+        return;
+      }
+
+      const objStr = args[1].body;
+      if (!objStr || typeof objStr !== 'string' || !objStr.startsWith('jQuery')) {
+        return;
+      }
+
+      try {
+        const obj = JSON.parse('{' + (objStr.split('({')[1]).slice(0, -1));
+        if (!obj.data || !obj.data.datalist) {
+          return;
+        }
+
+        rawData[currentStockNumber] = {
+          start_h: obj.data.start_h,
+          start_m: obj.data.start_m,
+          end_h: obj.data.end_h,
+          end_m: obj.data.end_m,
+          datalist: obj.data.datalist
+        };
+
+        console.log(`[INFO] [FINISH CRAWL] [${currentStockNumber}]`);
+        clearTimeout(currentTimeout);
+        currentCallback();
+      } catch (e) {
+        console.log('[ERROR]', e);
+        console.log(`[RETRY] [${currentStockNumber}]`);
+        clearTimeout(currentTimeout);
+        startCrawlProcess(currentIndex);
+      }
+    });
+  });
+
+  const crawlRawData = async(index, callback) => {
+    if (index >= stockNumbers.length) {
+      protocol.close();
+      chrome.kill();
+      clearTimeout(currentTimeout);
+
+      finishCrawlRawData();
+      return;
+    }
+
+    const stockNumber = stockNumbers[index];
+    if (!!rawData[stockNumber]) {
+      return;
+    }
+
+    currentCallback = callback;
+    currentStockNumber = stockNumber;
+    currentIndex = index;
+
+    const requestURL = URLFromStockNumber(stockNumber);
+
+    console.log(`[INFO] [START] [${stockNumber}]`);
+
+    Page.navigate({
+      url: requestURL
+    });
+
+    clearTimeout(currentTimeout);
+    currentTimeout = setTimeout(() => {
+      if (!!rawData[currentStockNumber] || currentStockNumber !== stockNumber || currentIndex !== index) {
+        return;
+      }
+      console.log(`[INFO] [TIMEOUT] [${currentStockNumber}]`);
+      console.log(`[RETRY] [${currentStockNumber}]`);
+      startCrawlProcess(index);
+    }, 30000);
+  };
+
+  const startCrawlProcess = (index) => {
+    crawlRawData(index, () => {
+      startCrawlProcess(index + 1);
+    });
+  };
+
+  startCrawlProcess(0);
+};
+
+instream.on('end', () => {
+  startWholeProcess();
+});
+
+rl.on('line', function (line) {
+  stockNumbers = [...stockNumbers, line];
+});
